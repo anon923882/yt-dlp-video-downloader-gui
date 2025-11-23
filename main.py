@@ -1,6 +1,5 @@
 """
-YT-DLP Video Downloader CLI
-Modular, modern, and clear CLI with real parallel download, status panel, and adjustable light palette
+Professional, modular CLI for YT-DLP video downloading with light, readable coloring, configurable parallel downloads, and an always-visible status panel.
 """
 from __future__ import annotations
 import json
@@ -9,65 +8,153 @@ import re
 import shutil
 import sys
 import time
-import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional, Tuple
 import yt_dlp
-# COLOR PALETTE
+# ============== UI AND COLOR ==============
 class Palette:
-    MAIN = "\033[38;5;81m"          # blue
-    HEADER = "\033[38;5;117m"        # light cyan
-    ACCENT = "\033[38;5;223m"        # pastel yellow
-    SUCCESS = "\033[38;5;120m"       # light green
-    WARNING = "\033[38;5;208m"       # orange
-    ERROR = "\033[38;5;203m"         # salmon red
-    SYSTEM = "\033[38;5;149m"        # light purple
-    VALUE = "\033[38;5;153m"         # cyan light
-    CODE = "\033[38;5;51m"           # strong blue
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    INPUT = "\033[38;5;229m"         # cream
-# UI HELPERS
+    HEADER   = "\033[38;5;153m"
+    ACCENT   = "\033[38;5;215m"
+    SUCCESS  = "\033[38;5;40m"
+    WARNING  = "\033[38;5;214m"
+    ERROR    = "\033[38;5;203m"
+    SYSTEM   = "\033[38;5;252m"
+    VALUE    = "\033[38;5;51m"
+    CODE     = "\033[38;5;39m"
+    INFO     = "\033[38;5;81m"
+    BOLD     = "\033[1m"
+    RESET    = "\033[0m"
+# Coloring helpers
+
 def style(text: str, color: str) -> str:
-    if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty(): return text
-    return f"{color}{text}{Palette.RESET}"
-def accent(text: str) -> str: return style(text, Palette.ACCENT)
-def value_text(text: str) -> str: return style(text, Palette.VALUE)
-def success_text(text: str) -> str: return style(text, Palette.SUCCESS)
-def warning_text(text: str) -> str: return style(text, Palette.WARNING)
-def error_text(text: str) -> str: return style(text, Palette.ERROR)
-def code_text(text: str) -> str: return style(text, Palette.CODE)
+    return f"{color}{text}{Palette.RESET}" if supports_ansi() else text
+
+def status_text(val: bool) -> str:
+    return style("ON", Palette.SUCCESS) if val else style("OFF", Palette.WARNING)
+
+def value_text(text: str) -> str:
+    return style(text, Palette.VALUE)
+
+def accent(text: str) -> str:
+    return style(text, Palette.ACCENT)
+
 def header(text: str) -> None:
-    print(style(f"{'=' * 60}", Palette.HEADER))
-    print(style("YT-DLP Video Downloader", Palette.HEADER + Palette.BOLD))
-    print(style('=' * 60, Palette.HEADER))
-def format_label_value(label: str, value: str, enabled: Optional[bool] = None) -> str:
-    label_formatted = accent(label.ljust(20))
-    if enabled is None:
-        display = value_text(value)
-    elif enabled:
-        display = success_text(value)
-    else:
-        display = warning_text(value)
-    return f"{label_formatted} {display}"
-def prompt(text: str) -> str: return style(f"{text}: ", Palette.INPUT + Palette.BOLD)
+    print(style(text, Palette.HEADER + Palette.BOLD))
+
+def code_text(text: str) -> str:
+    return style(text, Palette.CODE)
+
+def info_text(text: str) -> str:
+    return style(text, Palette.INFO)
+
+def warning_text(text: str) -> str:
+    return style(text, Palette.WARNING)
+
+def error_text(text: str) -> str:
+    return style(text, Palette.ERROR)
+
 def clear_console() -> None:
     os.system('cls' if os.name == 'nt' else 'clear')
-# SETTINGS
-def bool_label(val: bool) -> Tuple[str, bool]:
-    return ("On" if val else "Off", val)
-def status_panel(settings: 'RuntimeSettings') -> List[str]:
-    # Show main status panel
-    return [
-        format_label_value("Output Folder", str(settings.OutputFolder)),
-        format_label_value("Overwrite", *bool_label(settings.OverwriteExisting)),
-        format_label_value("Parallel", str(settings.ParallelDownloads), enabled=settings.ParallelDownloads>1),
-        format_label_value("Retries", str(settings.RetryAttempts), enabled=settings.RetryAttempts>0),
-        format_label_value("Chunk Size", f"{settings.ChunkSizeKiB} KiB"),
-        format_label_value("Create Root Folder", *bool_label(settings.CreateRootFolder)),
-        format_label_value("Show Status Panel", *bool_label(settings.ShowStatusPanel)),
-    ]
+
+def prompt(text: str) -> str:
+    return style(f"{text}: ", Palette.ACCENT + Palette.BOLD)
+
+def supports_ansi() -> bool:
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+# ============= CURSOR/MENU RENDERING =============
+_CURSOR_HIDE_DEPTH = 0
+
+def push_hidden_cursor() -> None:
+    global _CURSOR_HIDE_DEPTH
+    if _CURSOR_HIDE_DEPTH == 0:
+        hide_cursor()
+    _CURSOR_HIDE_DEPTH += 1
+
+def pop_hidden_cursor(force: bool = False) -> None:
+    global _CURSOR_HIDE_DEPTH
+    if force:
+        _CURSOR_HIDE_DEPTH = 0
+        show_cursor()
+    elif _CURSOR_HIDE_DEPTH > 0:
+        _CURSOR_HIDE_DEPTH -= 1
+        if _CURSOR_HIDE_DEPTH == 0:
+            show_cursor()
+
+def is_cursor_hidden() -> bool:
+    return _CURSOR_HIDE_DEPTH > 0
+
+def hide_cursor() -> bool:
+    if supports_ansi():
+        try:
+            sys.stdout.write("\x1b[?25l")
+            sys.stdout.flush()
+            return True
+        except Exception:
+            pass
+    return False
+
+def show_cursor() -> bool:
+    if supports_ansi():
+        try:
+            sys.stdout.write("\x1b[?25h")
+            sys.stdout.flush()
+            return True
+        except Exception:
+            pass
+    return False
+class MenuScreen:
+    def __init__(self):
+        self._display_lines = 0
+        self._initial = True
+        self._supports_cursor = supports_ansi()
+        self._cursor_managed = False
+    def __enter__(self):
+        self._ensure_cursor_hidden()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+    def render(self, lines: List[str]):
+        self._ensure_cursor_hidden()
+        shown = self._measure_display_lines(lines)
+        if self._initial:
+            clear_console()
+            self._initial = False
+        elif self._supports_cursor and self._display_lines:
+            sys.stdout.write(f"\x1b[{self._display_lines}F\x1b[J")
+        else:
+            clear_console()
+        print("\n".join(lines))
+        self._display_lines = shown
+    def reset(self):
+        self._display_lines = 0
+        self._initial = True
+    def close(self):
+        if self._cursor_managed: pop_hidden_cursor()
+        self._cursor_managed = False
+        self.reset()
+    def _ensure_cursor_hidden(self):
+        if not self._cursor_managed: push_hidden_cursor(); self._cursor_managed = True
+        elif not is_cursor_hidden(): push_hidden_cursor()
+    def _measure_display_lines(self, lines: List[str]) -> int:
+        try:
+            width = shutil.get_terminal_size(fallback=(80,24)).columns
+        except Exception:
+            width = 80
+        total = 0
+        width = max(1, width)
+        for entry in lines:
+            plain = strip_ansi(entry)
+            total += max(1, (len(plain) + width - 1) // width) if plain else 1
+        return total
+# ============= SETTINGS AND STATUS =============
+SETTINGS_PATH = Path(__file__).resolve().parent / "settings.json"
+
 @dataclass
 class RuntimeSettings:
     OutputFolder: Path = Path("downloads")
@@ -75,232 +162,294 @@ class RuntimeSettings:
     ParallelDownloads: int = 4
     RetryAttempts: int = 2
     ChunkSizeKiB: int = 512
-    CreateRootFolder: bool = True
     ShowStatusPanel: bool = True
-    SettingsPath: Path = field(default_factory=lambda: Path(__file__).parent / "settings.json", repr=False)
-    def __post_init__(self):
-        self.OutputFolder = self.OutputFolder.expanduser()
-    def to_payload(self) -> Dict:
-        return {
-            "OutputFolder": str(self.OutputFolder),
-            "OverwriteExisting": self.OverwriteExisting,
-            "ParallelDownloads": self.ParallelDownloads,
-            "RetryAttempts": self.RetryAttempts,
-            "ChunkSizeKiB": self.ChunkSizeKiB,
-            "CreateRootFolder": self.CreateRootFolder,
-            "ShowStatusPanel": self.ShowStatusPanel,
-        }
+    SettingsPath: Path = field(default=SETTINGS_PATH, init=False, repr=False)
+    def __post_init__(self): self.refresh_paths()
+    def refresh_paths(self): self.OutputFolder = self.OutputFolder.expanduser()
+    def to_payload(self) -> Dict[str, object]:
+        return {"OutputFolder": str(self.OutputFolder), "OverwriteExisting": self.OverwriteExisting, "ParallelDownloads": self.ParallelDownloads, "RetryAttempts": self.RetryAttempts, "ChunkSizeKiB": self.ChunkSizeKiB, "ShowStatusPanel": self.ShowStatusPanel}
     def save(self):
-        self.SettingsPath.parent.mkdir(exist_ok=True)
-        with self.SettingsPath.open("w", encoding="utf-8") as f:
-            json.dump(self.to_payload(), f, indent=2)
+        self.SettingsPath.parent.mkdir(parents=True, exist_ok=True)
+        with self.SettingsPath.open("w", encoding="utf-8") as h:
+            json.dump(self.to_payload(), h, indent=2)
     @classmethod
-    def load(cls):
+    def load(cls) -> "RuntimeSettings":
+        instance = cls()
+        if not instance.SettingsPath.exists(): return instance
         try:
-            path = Path(__file__).parent / "settings.json"
-            data = json.loads(path.read_text("utf-8"))
-            return cls(
-                OutputFolder=Path(data.get("OutputFolder", "downloads")),
-                OverwriteExisting=bool(data.get("OverwriteExisting", False)),
-                ParallelDownloads=int(data.get("ParallelDownloads", 4)),
-                RetryAttempts=int(data.get("RetryAttempts", 2)),
-                ChunkSizeKiB=int(data.get("ChunkSizeKiB", 512)),
-                CreateRootFolder=bool(data.get("CreateRootFolder", True)),
-                ShowStatusPanel=bool(data.get("ShowStatusPanel", True)),
-            )
+            payload = json.loads(instance.SettingsPath.read_text(encoding="utf-8"))
         except Exception:
-            return cls()
-def format_size(size: int) -> str:
+            return instance
+        if isinstance(payload, dict):
+            for f in ["OutputFolder", "OverwriteExisting", "ParallelDownloads", "RetryAttempts", "ChunkSizeKiB", "ShowStatusPanel"]:
+                v = payload.get(f)
+                if v is not None:
+                    setattr(instance, f, v if f != "OutputFolder" else Path(v))
+        instance.refresh_paths()
+        return instance
+# ----------- STATUS PANEL -----------
+def format_size(sz: int) -> str:
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    value = float(size)
-    for unit in units:
-        if value < 1024.0:
-            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024.0
-    return f"{value:.1f} TiB"
-# PROGRESS
-class ProgressDisplay:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.completed = 0
-        self.failed = 0
-    def update(self, filename: str, percent: str, speed: str):
-        with self.lock:
-            progress_text = f"Progress: {value_text(percent)} | Speed: {value_text(speed)}"
-            print(f"\r{style('[Download]', Palette SYSTEM)} {code_text(filename)} {progress_text}", end="", flush=True)
-    def complete(self, filename: str, success: bool):
-        with self.lock:
-            self.completed += int(success)
-            self.failed += int(not success)
-            status = success_text("✓ Complete") if success else error_text("✗ Failed")
-            print(f"\r{style('[Download]', Palette.SYSTEM)} {code_text(filename)} {status}")
-# VIDEO
-class VideoTask(threading.Thread):
-    def __init__(self, url, format_id, output_dir, progress, retries):
-        threading.Thread.__init__(self)
-        self.url = url
-        self.format_id = format_id
-        self.output_dir = output_dir
-        self.progress = progress
-        self.retries = retries
-        self.success = False
-        self.error = None
-    def run(self):
-        attempt = 0
-        while attempt <= self.retries:
-            try:
-                def hook(d):
-                    if d['status'] == 'downloading':
-                        file = Path(d.get('filename', 'video')).name
-                        percent = d.get('_percent_str', 'N/A').strip()
-                        speed = d.get('_speed_str', 'N/A').strip()
-                        self.progress.update(file, percent, speed)
-                    elif d['status'] == 'finished':
-                        file = Path(d.get('filename', 'video')).name
-                        self.progress.complete(file, True)
-                opts = {'format': self.format_id,
-                        'outtmpl': str(self.output_dir / '%(title)s.%(ext)s'),
-                        'progress_hooks': [hook],
-                        'quiet': True}
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([self.url])
-                self.success = True
-                return
-            except Exception as e:
-                attempt += 1
-                self.error = str(e)
-        self.progress.complete(self.url, False)
-# FORMATS
-def fetch_formats(url: str):
+    val = float(sz)
+    for i, unit in enumerate(units):
+        if val < 1024 or i==len(units)-1:
+            return f"{int(val)} {unit}" if unit=="B" else f"{val:.2f} {unit}"
+        val /= 1024
+
+def status_panel(settings: RuntimeSettings) -> List[str]:
+    return [
+        style("YT-DLP CLI STATUS", Palette.HEADER),
+        f" {accent('Output folder').ljust(15)} {info_text(str(settings.OutputFolder))}",
+        f" {accent('Overwrite').ljust(15)} {status_text(settings.OverwriteExisting)}",
+        f" {accent('Parallel').ljust(15)} {value_text(str(settings.ParallelDownloads))}",
+        f" {accent('Retries').ljust(15)} {value_text(str(settings.RetryAttempts))}",
+        f" {accent('Chunk (KiB)').ljust(15)} {value_text(str(settings.ChunkSizeKiB))}",
+        f" {accent('Show Status').ljust(15)} {status_text(settings.ShowStatusPanel)}",
+        ""
+    ] if settings.ShowStatusPanel else []
+# ============= MENUS =============
+def format_menu_option(label: str, value: str = "", hint: str = "", selected: bool = False) -> str:
+    marker = style("›", Palette.ACCENT) if selected else " "
+    label_styled = style(label, Palette.ACCENT + Palette.BOLD) if selected else label
+    val_col = Palette.SUCCESS if value in ["ON", "on", "ENABLED"] else Palette.WARNING if value in ["OFF", "off", "DISABLED"] else Palette.VALUE
+    parts = [f"{marker} {label_styled}"]
+    if value:
+        parts.append(style(f"{value}", val_col))
+    if hint:
+        parts.append(style(f"({hint})", Palette.WARNING))
+    return " ".join(parts)
+def supports_keyboard_navigation() -> bool:
     try:
-        opts = {'quiet': True, 'no_warnings': True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        import msvcrt
+        return True
+    except ImportError:
+        try:
+            import tty, termios
+            return sys.stdin.isatty()
+        except ImportError:
+            return False
+
+def read_keypress() -> str:
+    try:
+        import msvcrt
+        while msvcrt.kbhit(): msvcrt.getch()
+        key = msvcrt.getch()
+        if key in (b'\x00', b'\xe0'):
+            k = msvcrt.getch()
+            return "UP" if k==b'H' else "DOWN" if k==b'P' else ""
+        elif key == b'\r': return "ENTER"
+        elif key == b' ': return "SPACE"
+        elif key == b'\x1b': return "ESC"
+    except ImportError:
+        import tty, termios, select
+        fd = sys.stdin.fileno()
+        orig = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch in {'\r','\n'}: return "ENTER"
+            if ch == '\x1b':
+                ready,_,_ = select.select([sys.stdin],[],[],0.05)
+                if not ready: return "ESC"
+                next = sys.stdin.read(1)
+                if next == '[':
+                    arr = sys.stdin.read(1)
+                    return "UP" if arr=='A' else "DOWN" if arr=='B' else ""
+                return next
+            if ch == ' ': return "SPACE"
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, orig)
+    return ""
+# ============= DOWNLOAD AND FORMAT LOGIC =============
+def fetch_formats(url: str) -> Tuple[Optional[dict], Optional[List[dict]], Optional[str]]:
+    try:
+        with yt_dlp.YoutubeDL({'quiet':True,'no_warnings':True}) as ydl:
             info = ydl.extract_info(url, download=False)
             formats = [
                 {
                     'format_id': f.get('format_id'),
                     'height': f.get('height', 0),
-                    'ext': f.get('ext', ''),
-                    'filesize': format_size(f.get('filesize', 0)) if f.get('filesize') else "Unknown size",
-                    'fps': f.get('fps', 'N/A'),
+                    'ext': f.get('ext', 'N/A'),
+                    'filesize': f.get('filesize', 0),
+                    'fps': f.get('fps', 'N/A')
                 }
                 for f in info.get('formats', []) if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
             return info, formats, None
     except Exception as e:
         return None, None, str(e)
-def select_format(formats):
+
+def download_job(url:str, format_id:str, out_path:Path, progress:ProgressDisplay, tries:int=1) -> Tuple[bool, Optional[str]]:
+    last_exception = None
+    for attempt in range(1,tries+1):
+        try:
+            def progress_hook(d):
+                if d['status']=='downloading':
+                    filename = Path(d.get('filename','video')).name
+                    percent = d.get('_percent_str', 'N/A').strip()
+                    speed = d.get('_speed_str', 'N/A').strip()
+                    progress.update(filename, percent, speed)
+                elif d['status']=='finished':
+                    filename = Path(d.get('filename','video')).name
+                    progress.complete(filename, True)
+            opts = {'format':format_id,'outtmpl':str(out_path/'%(title)s.%(ext)s'),'progress_hooks':[progress_hook],'quiet':True}
+            with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([url])
+            return True, None
+        except Exception as exc:
+            last_exception = exc
+    return False,str(last_exception)
+
+class ProgressDisplay:
+    def __init__(self):
+        self._current_file = ''
+        self._lock = Lock()
+        self._last_update = 0.0
+    def update(self, filename:str, percent:str, speed:str):
+        now = time.time()
+        if now-self._last_update<0.5: return
+        self._last_update = now
+        with self._lock:
+            if filename != self._current_file:
+                self._current_file = filename
+                print(f"\n{style('[Download]',Palette.INFO)} {code_text(filename)}")
+            print(f"\rProgress: {value_text(percent)} | Speed: {value_text(speed)}", end='', flush=True)
+    def complete(self, filename:str,success:bool):
+        with self._lock:
+            status = style('✓ Done', Palette.SUCCESS) if success else style('✗ Failed', Palette.ERROR)
+            print(f"\r{style('[Download]',Palette.INFO)} {code_text(filename)}: {status}")
+# ============= MENU/CONTROL =============
+def select_format(formats: List[dict]) -> Optional[dict]:
+    if not formats: return None
     selection = 0
-    nav = accent("Use ↑/↓, Enter to select, ESC to cancel.")
-    while True:
-        clear_console()
-        print(style("Select Format", Palette.MAIN + Palette.BOLD))
-        for i, fmt in enumerate(formats):
-            sel = style('►', Palette.ACCENT) if i == selection else ' '
-            text = f"{sel} {fmt['height']}p [{fmt['ext']}] {fmt['filesize']}, {fmt['fps']} fps"
-            print(style(text, Palette.HEADER if i == selection else Palette.ACCENT))
-        print(nav)
-        key = input().lower()
-        if key == 'up': selection = (selection - 1) % len(formats)
-        elif key == 'down': selection = (selection + 1) % len(formats)
-        elif key == 'enter': return formats[selection]
-        elif key == 'esc': return None
-# DOWNLOAD
-def download_videos(tasks, parallel):
-    active = []
-    for task in tasks:
-        while len(active) >= parallel:
-            for t in active:
-                if not t.is_alive(): active.remove(t)
-            time.sleep(0.1)
-        task.start()
-        active.append(task)
-    for t in active:
-        t.join()
-# MAIN LOGIC
+    navigation_hint = style("Use ↑/↓ to navigate, Enter to select, ESC to cancel.", Palette.ACCENT)
+    with MenuScreen() as screen:
+        while True:
+            lines = [style("Select Format", Palette.HEADER)]
+            for idx, fmt in enumerate(formats):
+                h=fmt['height']; ext=fmt['ext']; sz=format_size(fmt['filesize']) if fmt['filesize'] else 'Unknown size'; fps=fmt['fps']
+                label = f"{h}p"; value = f"{ext} | {sz} | {fps} fps"
+                lines.append(format_menu_option(label, value=value, selected=selection==idx))
+            lines.append(""); lines.append(navigation_hint);screen.render(lines)
+            k = read_keypress()
+            if k=="UP": selection = (selection-1)%len(formats)
+            elif k=="DOWN": selection=(selection+1)%len(formats)
+            elif k=="ENTER": screen.reset(); return formats[selection]
+            elif k=="ESC": screen.reset(); return None
+
+def handle_download(settings: RuntimeSettings):
+    clear_console(); pop_hidden_cursor(force=True)
+    lines = status_panel(settings)
+    if lines: print("\n".join(lines))
+    header("Download Video")
+    url = input(prompt("Enter video URL")).strip()
+    if not url:
+        print(warning_text("No URL provided")); input(prompt("Press Enter to continue")); return
+    print(info_text("Fetching formats..."))
+    info, formats, error = fetch_formats(url)
+    if error:
+        print(error_text(f"Error: {error}")); input(prompt("Press Enter to continue")); return
+    if not formats:
+        print(warning_text("No combined video+audio formats found")); input(prompt("Press Enter to continue")); return
+    formats.sort(key=lambda x:x['height'],reverse=True)
+    selected = select_format(formats)
+    if not selected:
+        print(info_text("Download cancelled")); input(prompt("Press Enter to continue")); return
+    clear_console(); lines = status_panel(settings)
+    if lines: print("\n".join(lines))
+    header("Download Summary")
+    print(f" Title: {value_text(info.get('title','Unknown'))}\n Quality: {value_text(str(selected['height'])+'p')}\n Format: {value_text(selected['ext'])}\n Size: {value_text(format_size(selected['filesize']) if selected['filesize'] else 'Unknown')}\n Destination: {info_text(str(settings.OutputFolder))}")
+    if input(prompt("Start download? (y/n)")).strip().lower() != 'y':
+        print(warning_text("Download cancelled")); input(prompt("Press Enter to continue")); return
+    settings.OutputFolder.mkdir(parents=True, exist_ok=True)
+    print(info_text("Starting download..."))
+    progress = ProgressDisplay()
+    result_errs = []
+    with ThreadPoolExecutor(max_workers=settings.ParallelDownloads) as pool:
+        futs = [ pool.submit(download_job, url, selected['format_id'], settings.OutputFolder, progress, settings.RetryAttempts) ]
+        for fut in as_completed(futs):
+            success, err = fut.result()
+            if not success: result_errs.append(err)
+    print(success_text("Download completed!" if not result_errs else "Some downloads failed"))
+    if result_errs:
+        for e in result_errs:
+            print(error_text(str(e)))
+    input(prompt("Press Enter to continue"))
+
+def configure_settings(settings: RuntimeSettings):
+    selection = 0
+    def build_options() -> list[dict]:
+        return [
+            {"label": "Output folder", "value": str(settings.OutputFolder), "action": "output"},
+            {"label": "Overwrite", "value": "ON" if settings.OverwriteExisting else "OFF", "action": "overwrite"},
+            {"label": "Parallel dl", "value": str(settings.ParallelDownloads), "action": "parallel"},
+            {"label": "Retries", "value": str(settings.RetryAttempts), "action": "retries"},
+            {"label": "Chunk KiB", "value": str(settings.ChunkSizeKiB), "action": "chunk"},
+            {"label": "Status panel", "value": "ON" if settings.ShowStatusPanel else "OFF", "action": "status"},
+            {"label": "Back", "hint": "main menu", "action": "back"},
+        ]
+    navigation_hint = style("Use ↑/↓ to navigate, Enter to select.", Palette.ACCENT)
+    with MenuScreen() as screen:
+        while True:
+            opts = build_options()
+            selection = min(selection, len(opts)-1)
+            lines = status_panel(settings) + [style("Settings",Palette.HEADER)]
+            for idx, o in enumerate(opts):
+                lines.append(format_menu_option(o['label'], value=o.get('value',''), hint=o.get('hint',''), selected=selection==idx))
+            lines.append(""); lines.append(navigation_hint); screen.render(lines); k=read_keypress()
+            if k=="UP": selection = (selection - 1) % len(opts)
+            elif k=="DOWN": selection = (selection + 1) % len(opts)
+            elif k=="ENTER":
+                c=opts[selection]['action']; screen.reset(); clear_console(); pop_hidden_cursor(force=True)
+                if c=="output":
+                    p=input(prompt("New output folder")).strip();
+                    if p: settings.OutputFolder=Path(p); settings.refresh_paths(); settings.save(); print(success_text("Output folder updated"))
+                    else: print(warning_text("No folder provided"))
+                    input(prompt("Press Enter to continue"))
+                elif c=="overwrite":
+                    settings.OverwriteExisting = not settings.OverwriteExisting;settings.save(); print(success_text("Overwrite toggled")); input(prompt("Press Enter to continue"))
+                elif c=="parallel":
+                    v=input(prompt("Parallel downloads (1-16)")).strip();
+                    if v.isdigit():settings.ParallelDownloads=max(1,min(16,int(v)));settings.save(); print(success_text(f"Parallel set to {settings.ParallelDownloads}"))
+                    else: print(warning_text("Invalid number")); input(prompt("Press Enter to continue"))
+                elif c=="retries":
+                    v=input(prompt("Retries (0-10)")).strip();
+                    if v.isdigit():settings.RetryAttempts=max(0,min(10,int(v)));settings.save(); print(success_text(f"Retries set to {settings.RetryAttempts}"))
+                    else: print(warning_text("Invalid number")); input(prompt("Press Enter to continue"))
+                elif c=="chunk":
+                    v=input(prompt("Chunk size in KiB (64-4096)")).strip();
+                    if v.isdigit():settings.ChunkSizeKiB=max(64,min(4096,int(v)));settings.save(); print(success_text("Chunk size updated"))
+                    else: print(warning_text("Invalid number")); input(prompt("Press Enter to continue"))
+                elif c=="status":
+                    settings.ShowStatusPanel = not settings.ShowStatusPanel; settings.save(); print(success_text("Status panel toggled")); input(prompt("Press Enter to continue"))
+                elif c=="back": break
+                screen.reset()
 def main():
     settings = RuntimeSettings.load()
-    while True:
-        clear_console()
-        header("Main Menu")
-        if settings.ShowStatusPanel:
-            print('\n'.join(status_panel(settings)))
-            print('')
-        print(accent("Choose an option:"))
-        opts = ["Download Video", "Settings", "Exit"]
-        for i, o in enumerate(opts): print(style(f"{'►' if i==0 else ' '} {o}", Palette.MAIN))
-        choice = input().lower()
-        if choice == 'download video' or choice == '1':
-            clear_console()
-            url = input(prompt("Enter video URL")).strip()
-            if not url:
-                print(warning_text("No URL entered."))
-                input(prompt("Press Enter to continue"))
-                continue
-            info, formats, err = fetch_formats(url)
-            if err or not formats:
-                print(error_text(f"Failed to fetch formats: {err or 'No formats'}"))
-                input(prompt("Press Enter to continue"))
-                continue
-            selected = select_format(formats)
-            if not selected:
-                print(warning_text("Download cancelled"))
-                continue
-            print(value_text(f"Selected: {selected['height']}p [{selected['ext']}] {selected['filesize']}"))
-            confirm = input(prompt("Proceed with download? (y/n)")).strip().lower()
-            if confirm != 'y': continue
-            # Actual download
-            progress = ProgressDisplay()
-            task = VideoTask(url, selected['format_id'], settings.OutputFolder, progress, settings.RetryAttempts)
-            download_videos([task], settings.ParallelDownloads)
-            status = success_text("Success") if task.success else error_text(f"Error: {task.error}")
-            print(status)
-            input(prompt("Press Enter to continue"))
-        elif choice == 'settings' or choice == '2':
-            clear_console()
-            options = [
-                ("Output Folder", str(settings.OutputFolder)),
-                ("Overwrite Existing", "On" if settings.OverwriteExisting else "Off"),
-                ("Parallel Downloads", str(settings.ParallelDownloads)),
-                ("Retry Attempts", str(settings.RetryAttempts)),
-                ("Chunk Size KiB", str(settings.ChunkSizeKiB)),
-                ("Create Root Folder", "On" if settings.CreateRootFolder else "Off"),
-                ("Show Status Panel", "On" if settings.ShowStatusPanel else "Off"),
-            ]
-            print(style("Settings (edit by number):", Palette.HEADER))
-            for idx, (name, val) in enumerate(options):
-                color = Palette.SUCCESS if val == "On" else Palette.WARNING if val == "Off" else Palette.VALUE
-                enabled = val == "On"
-                print(f"{idx+1}. {style(name, Palette.MAIN)}: {style(val, color)}")
-            print(style("0. Back", Palette.ERROR))
-            sel = input(prompt("Select setting to edit"))
-            if sel == '0' or sel.lower() == 'back': continue
-            try:
-                sel = int(sel) - 1
-                if sel < 0 or sel >= len(options): continue
-            except Exception: continue
-            key = options[sel][0]
-            if key == "Output Folder":
-                new = input(prompt("New output folder"))
-                if new: settings.OutputFolder = Path(new).expanduser()
-            elif key == "Overwrite Existing":
-                settings.OverwriteExisting = not settings.OverwriteExisting
-            elif key == "Parallel Downloads":
-                val = input(prompt("Parallel downloads count (1-32)"))
-                if val.isdigit(): settings.ParallelDownloads = max(1, min(32, int(val)))
-            elif key == "Retry Attempts":
-                val = input(prompt("Number of retry attempts (0-10)"))
-                if val.isdigit(): settings.RetryAttempts = max(0, min(10, int(val)))
-            elif key == "Chunk Size KiB":
-                val = input(prompt("Chunk Size (64-4096) KiB"))
-                if val.isdigit(): settings.ChunkSizeKiB = max(64, min(4096, int(val)))
-            elif key == "Create Root Folder":
-                settings.CreateRootFolder = not settings.CreateRootFolder
-            elif key == "Show Status Panel":
-                settings.ShowStatusPanel = not settings.ShowStatusPanel
-            settings.save()
-            print(success_text("Setting updated."))
-            input(prompt("Press Enter to continue"))
-        else:
-            print(success_text("Goodbye!")); break
+    if not supports_keyboard_navigation():
+        print(error_text("Keyboard navigation required. Run in interactive terminal.")); return
+    selection = 0
+    def build_options() -> list[dict]:
+        return [
+            {"label": "Download video", "action": "download"},
+            {"label": "Settings", "action": "settings"},
+            {"label": "Exit", "action": "exit"},
+        ]
+    navigation_hint = style("Use ↑/↓ to navigate, Enter to select.", Palette.ACCENT)
+    with MenuScreen() as screen:
+        while True:
+            opts = build_options()
+            selection = min(selection, len(opts)-1)
+            lines = status_panel(settings) + [style("YT-DLP Video Downloader", Palette.HEADER+Palette.BOLD), "", style("Menu", Palette.HEADER)]
+            for idx, o in enumerate(opts):
+                lines.append(format_menu_option(o['label'], selected=selection==idx))
+            lines.append(""); lines.append(navigation_hint); screen.render(lines); k=read_keypress()
+            if k=="UP": selection = (selection - 1) % len(opts)
+            elif k=="DOWN": selection = (selection + 1) % len(opts)
+            elif k=="ENTER":
+                c=opts[selection]['action']; screen.reset(); clear_console();
+                if c=="download": handle_download(settings)
+                elif c=="settings": configure_settings(settings)
+                elif c=="exit": print(success_text("Goodbye!")); break
+                screen.reset()
+    clear_console()
 if __name__ == "__main__":
     main()
